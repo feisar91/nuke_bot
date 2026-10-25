@@ -70,6 +70,8 @@ def load_schedule(channel_id):
 
 # Channel id: auto nuke schedule, only for accepted channels with auto nuke turned on
 schedules = {channel_id: schedule for channel_id in accepted_channels if (schedule := load_schedule(channel_id))}
+# Channel id: date of the auto nuke that /delay skipped
+delayed_nukes = {}
 
 bot = discord.Bot()
 
@@ -107,7 +109,7 @@ def gif_duration(path):
 def replace_channel_id(old_id, new_id):
     # Obliterating recreates the channel with a new id, so carry it over in memory and in the config file
     accepted_channels[accepted_channels.index(old_id)] = new_id
-    for mapping in (post_nuke_gifs, auto_nuke_channels, schedules):
+    for mapping in (post_nuke_gifs, auto_nuke_channels, schedules, delayed_nukes):
         if old_id in mapping:
             mapping[new_id] = mapping.pop(old_id)
     with open(config_path, 'r') as f:
@@ -226,14 +228,44 @@ def main():
     # instead and fire each job at most once per day when the local time in the configured timezone matches
     last_run = {}
 
+    def occurrence(date, target):
+        # Round trip through UTC so a time skipped by a DST change moves to just after the gap
+        return datetime.datetime.combine(date, target, tzinfo=tz).astimezone(datetime.timezone.utc).astimezone(tz)
+
     def is_due(name, target):
         now = datetime.datetime.now(tz)
-        # Round trip through UTC so a time skipped by a DST change moves to just after the gap
-        scheduled = datetime.datetime.combine(now.date(), target, tzinfo=tz).astimezone(datetime.timezone.utc).astimezone(tz)
+        scheduled = occurrence(now.date(), target)
         if (now.hour, now.minute) != (scheduled.hour, scheduled.minute) or last_run.get(name) == now.date():
             return False
         last_run[name] = now.date()
         return True
+
+    def next_nuke_date(channel_id, schedule):
+        now = datetime.datetime.now(tz)
+        scheduled = occurrence(now.date(), schedule['nuke_time'])
+        if last_run.get(('auto_nuke', channel_id)) == now.date() or (now.hour, now.minute) > (scheduled.hour, scheduled.minute):
+            return now.date() + datetime.timedelta(days=1)
+        return now.date()
+
+    def is_delayed(channel_id, minutes_until_nuke):
+        return delayed_nukes.get(channel_id) == (datetime.datetime.now(tz) + datetime.timedelta(minutes=minutes_until_nuke)).date()
+
+    @bot.slash_command(description='Delays the daily auto nuke in this channel until the next day', guild_ids=guilds)
+    async def delay(ctx):
+        schedule = schedules.get(ctx.channel.id)
+        if schedule is None:
+            await ctx.respond('This channel has no daily auto nuke to delay.', ephemeral=True)
+            return
+        weapon = schedule['weapon'].lower()
+        skipped = next_nuke_date(ctx.channel.id, schedule)
+        next_time = int(occurrence(skipped + datetime.timedelta(days=1), schedule['nuke_time']).timestamp())
+        when = f'<t:{next_time}:F> (<t:{next_time}:R>)'
+        if delayed_nukes.get(ctx.channel.id) == skipped:
+            await ctx.respond(f'The daily {weapon} is already delayed until {when}.', ephemeral=True)
+            return
+        delayed_nukes[ctx.channel.id] = skipped
+        log.info(f'{ctx.author.name} delayed the auto {weapon} in {ctx.channel.name} on {skipped} to the next day')
+        await ctx.respond(f'The daily {weapon} has been delayed until {when}.')
 
     def get_channel(channel_id):
         channel = bot.get_channel(channel_id)
@@ -254,13 +286,20 @@ def main():
         # Obliterating swaps channel ids in schedules, so iterate over a copy
         for channel_id, schedule in list(schedules.items()):
             if is_due(('warning', channel_id), schedule['warning_time']) and (channel := get_channel(channel_id)):
-                log.info(f'Sending deletion warning to {channel.name}')
                 lead = schedule['warning_lead']
-                try:
-                    await channel.send(f'This channel will be nuked in {lead} minute{"" if lead == 1 else "s"}!')
-                except discord.HTTPException as e:
-                    log.error(f'Could not send deletion warning to {channel.name}: {e}')
+                if is_delayed(channel_id, lead):
+                    log.info(f'Auto nuke on {channel.name} is delayed, not sending deletion warning')
+                else:
+                    log.info(f'Sending deletion warning to {channel.name}')
+                    try:
+                        await channel.send(f'This channel will be nuked in {lead} minute{"" if lead == 1 else "s"}!')
+                    except discord.HTTPException as e:
+                        log.error(f'Could not send deletion warning to {channel.name}: {e}')
             if is_due(('auto_nuke', channel_id), schedule['nuke_time']) and (channel := get_channel(channel_id)):
+                if is_delayed(channel_id, 0):
+                    del delayed_nukes[channel_id]
+                    log.info(f'Auto {schedule["weapon"].lower()} on {channel.name} is delayed until tomorrow, skipping')
+                    continue
                 log.info(f'Deploying auto {schedule["weapon"].lower()} on {channel.name}')
                 task = asyncio.create_task(nuke_routine(channel, schedule['weapon']))
                 running_nukes.add(task)
